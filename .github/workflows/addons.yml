@@ -1,4 +1,4 @@
-name: generate addons.json
+name: generate addons-data.json
 
 concurrency:
   group: "main"
@@ -9,7 +9,6 @@ on:
     paths:
       - 'addons.py'
       - 'verified.json'
-      - 'inject.json'
       - '.github/workflows/addons.yml'
   schedule:
     - cron: "0 5 * * *"
@@ -23,31 +22,20 @@ jobs:
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.8
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: '3.8'
-          architecture: 'x64'
+          cache: 'pip'
 
-      # Cache dependencies. From:
-      # https://github.com/actions/cache/blob/master/examples.md#python---pip
-      - uses: actions/cache@v2
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      # Install dependencies with `pip`
       - name: Install requirements
-        run: |
-          python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install -r requirements.txt
+        run: python3 -m pip install -r requirements.txt
+
       - name: Generate JSON files
-        run: |
-          python3 --version
-          python3 addons.py
+        run: python3 addons.py
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
@@ -58,5 +46,5 @@ jobs:
           git config user.email "null"
           git add .
           # "echo" returns true so the build succeeds, even if no changed files
-          git commit --amend -m 'Update JSON files' || echo
+          git commit -m 'Update JSON files' || echo
           git push --force
