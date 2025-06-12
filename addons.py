@@ -3,6 +3,8 @@ import json
 from os import getenv
 from time import sleep
 import re
+import io
+import zipfile
 
 VERIFIED = json.load(open('verified.json', "r+", encoding='utf-8'))
 
@@ -14,6 +16,7 @@ HEADERS = {"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.gith
 # regex
 FEATURE_RE = re.compile("(?:add\(new )([^(]+)(?:\([^)]*)\)\)")
 INVITE_RE = re.compile("((?:https?:\/\/)?(?:www.)?(?:discord.(?:gg|io|me|li|com)|discordapp.com\/invite|dsc.gg)\/[a-zA-z0-9-\/]+)")
+VERSION_RE = re.compile("^\s*(?:mc|minecraft)_version\s*=\s*(1\.\d{2}\.\d(?:-pre\d)?)\s*$", flags=re.MULTILINE)
 
 def sleep_if_rate_limited(type="search"):
     for _ in range(RETRY_COUNT):
@@ -52,8 +55,8 @@ def parse_repo(repoName):
                 authors.append(author)
             else:
                 authors.append(author["name"])
-        if len(authors) == 0:
-            authors.append(repo['owner']['login'])
+    if len(authors) == 0:
+        authors.append(repo['owner']['login'])
     
     links = {"github": repo['html_url']}
     
@@ -62,29 +65,6 @@ def parse_repo(repoName):
         summary = fabric.get("description") or repo['description']
     except Exception:
         print("[summary] error. ignoring...")
-    
-    # direct download from releases
-    downloads = 0
-    try:
-        releases = requests.get(f"https://api.github.com/repos/{repoName}/releases", headers=HEADERS).json()
-        url = None
-        for release in releases:
-            for asset in release['assets']:
-                asset_name: str = asset['name'].lower()
-                if asset_name.endswith("-dev.jar") or asset_name.endswith("-sources.jar") or asset_name.endswith("-all.jar") or asset_name.endswith("-javadoc.jar"):
-                    continue
-                if asset_name.endswith(".jar"):
-                    url = asset['browser_download_url']
-                    downloads = asset['download_count']
-                    break
-            if url != None:
-                break
-        if url == None:
-            print("missing release")
-        else:
-            links["download"] = url
-    except Exception:
-        print("[dl] error. ignoring...")
     
     # icon from mod metadata
     icon = None
@@ -110,12 +90,14 @@ def parse_repo(repoName):
     else:
         # find discord server by looking at readme mod and repository metadata
         try:
-            readme = requests.get(f"https://raw.githubusercontent.com/{repoName}/{repo['default_branch']}/README.md").text
-            invites = INVITE_RE.findall(readme) + INVITE_RE.findall(str(fabric)) + INVITE_RE.findall(str(repo))
-            for invite in invites:
-                if requests.head(invite).status_code != 404:
-                    links["discord"] = invite
-                    break
+            readmeRes = requests.get(f"https://raw.githubusercontent.com/{repoName}/{repo['default_branch']}/README.md")
+            if readmeRes.status_code == 200:
+                readme = readmeRes.text
+                invites = INVITE_RE.findall(readme) + INVITE_RE.findall(str(fabric)) + INVITE_RE.findall(str(repo))
+                for invite in invites:
+                    if requests.head(invite).status_code != 404:
+                        links["discord"] = invite
+                        break
         except Exception:
             print("[discord invite] error. ignoring...")
 
@@ -142,6 +124,68 @@ def parse_repo(repoName):
                 features.append(f"...and {count} more")
         except Exception:
             print("[features] error. ignoring...")
+
+    # direct download from releases
+    downloads = 0
+    depends = {}
+    breaks = {}
+    try:
+        releases = requests.get(f"https://api.github.com/repos/{repoName}/releases", headers=HEADERS).json()
+        url = None
+        for release in releases:
+            for asset in release['assets']:
+                asset_name: str = asset['name'].lower()
+                if asset_name.endswith("-dev.jar") or asset_name.endswith("-sources.jar") or asset_name.endswith("-all.jar") or asset_name.endswith("-javadoc.jar"):
+                    continue
+                if asset_name.endswith(".jar"):
+                    url = asset['browser_download_url']
+                    downloads = asset['download_count']
+                    break
+            if url != None:
+                break
+
+        if url == None:
+            print("missing release")
+        else:
+            # analyze release fabric.mod.json to get dependency information
+            with requests.get(url) as res:
+                with zipfile.ZipFile(io.BytesIO(res.content)) as jar:
+                    if "fabric.mod.json" in jar.namelist():
+                        with jar.open("fabric.mod.json") as fmj:
+                            data = json.load(fmj)
+
+                            if "depends" in data:
+                                depends = data["depends"]
+
+                                # if these dependency ranges are too broad, throw them out
+                                if depends.get("minecraft", "*") == "*" and depends.get("meteor-client", "*") == "*":
+                                    depends = {}
+
+                            
+                            if "breaks" in data:
+                                breaks = data["breaks"]
+
+
+            links["download"] = url
+    except Exception as ex:
+        print(f"[dl] error {ex}. ignoring...")
+
+    # if no dependency information provided by fabric.mod.json, assume strictest requirements from gradle.properties
+    if len(depends) == 0:
+        try:
+            propertiesRes = requests.get(f"https://raw.githubusercontent.com/{repoName}/{repo['default_branch']}/gradle.properties")
+            if propertiesRes.status_code == 200:
+                properties = propertiesRes.text
+
+                match = re.search(VERSION_RE, properties)
+                if match:
+                    minecraft_version = match.group(1)
+
+                    depends = {
+                        "minecraft": minecraft_version
+                    }
+        except Exception as ex:
+            print(f"[dependency] error {ex}. ignoring...")
     
     result = {
         "authors": authors,
@@ -157,7 +201,11 @@ def parse_repo(repoName):
         "status": {
             "archived": repo['archived']
         },
-        "summary": summary
+        "summary": summary,
+        "dependency_resolution": {
+            "depends": depends,
+            "breaks": breaks
+        }
     }
 
     return result
